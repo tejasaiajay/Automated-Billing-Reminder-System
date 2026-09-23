@@ -114,3 +114,5 @@ NO PASSWORD
 There is no SENDER_PASSWORD in the Python code.
 
 Google OAuth is used instead.
+
+Feature branch: billing reminder implementation.
