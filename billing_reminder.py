@@ -1,73 +1,233 @@
 import os
+import base64
 import pandas as pd
+
 from datetime import date, timedelta
 from email.message import EmailMessage
-import base64
+
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-# Gmail permission
-SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
-# File names
-excel_file = "billing_data.xlsx"
-credentials_file = "credentials.json"
-token_file = "gmail_token.json"
-# STEP 1: Check Excel file
-if not os.path.exists(excel_file):
-    print("billing_data.xlsx file not found.")
-    exit()
-# Read Excel file
-data = pd.read_excel(excel_file)
+
+from customer_checker import check_customer_due
+from config import (
+    EXCEL_FILE,
+    CREDENTIALS_FILE,
+    TOKEN_FILE,
+    EMAIL_SUBJECT,
+    CUSTOMER_NAME_COLUMN,
+    CUSTOMER_EMAIL_COLUMN,
+    DUE_DATE_COLUMN,
+    SCOPES,
+    DUE_DAYS_BEFORE
+)
+
+
+def get_gmail_service():
+
+    credentials = None
+
+    if os.path.exists(TOKEN_FILE):
+        credentials = Credentials.from_authorized_user_file(
+            TOKEN_FILE,
+            SCOPES
+        )
+
+    if credentials and credentials.expired and credentials.refresh_token:
+        credentials.refresh(Request())
+
+    if not credentials or not credentials.valid:
+
+        if not os.path.exists(CREDENTIALS_FILE):
+            print("ERROR: credentials.json was not found.")
+            return None
+
+        flow = InstalledAppFlow.from_client_secrets_file(
+            CREDENTIALS_FILE,
+            SCOPES
+        )
+
+        credentials = flow.run_local_server(
+            port=0,
+            access_type="offline",
+            prompt="consent"
+        )
+
+        with open(TOKEN_FILE, "w") as token:
+            token.write(credentials.to_json())
+
+    return build(
+        "gmail",
+        "v1",
+        credentials=credentials
+    )
+
+
+def send_email(
+    service,
+    customer_name,
+    customer_email,
+    current_bill,
+    wifi_bill,
+    water_bill,
+    mobile_bill,
+    gas_bill,
+    due_date
+):
+
+    email = EmailMessage()
+
+    email["To"] = customer_email
+    email["Subject"] = EMAIL_SUBJECT
+
+    email_body = f"""
+Hello {customer_name},
+
+This is a friendly reminder that your upcoming bills are due on {due_date}.
+
+Bill Details:
+
+Current Bill: ${current_bill:.2f}
+WiFi Bill: ${wifi_bill:.2f}
+Water Bill: ${water_bill:.2f}
+Mobile Bill: ${mobile_bill:.2f}
+Gas Bill: ${gas_bill:.2f}
+
+Please ensure payment is submitted on time.
+
+Best regards,
+Finance Department
+"""
+
+    email.set_content(email_body)
+
+    encoded_email = base64.urlsafe_b64encode(
+        email.as_bytes()
+    ).decode()
+
+    service.users().messages().send(
+        userId="me",
+        body={"raw": encoded_email}
+    ).execute()
+
+    print("Email sent successfully to:", customer_email)
+
+
+# Check Excel file
+
+if not os.path.exists(EXCEL_FILE):
+
+    print("ERROR: Excel file was not found.")
+    print("Expected file:", EXCEL_FILE)
+
+    raise SystemExit
+
+
+# Read Excel
+
+data = pd.read_excel(EXCEL_FILE)
+
 print("Excel file read successfully.")
-# STEP 2: Get today's date
+
+
+# Check required columns
+
+required_columns = [
+    CUSTOMER_NAME_COLUMN,
+    CUSTOMER_EMAIL_COLUMN,
+    DUE_DATE_COLUMN,
+    "Current Bill",
+    "Wifi Bill",
+    "Water Bill",
+    "Mobile Bill",
+    "Gas Bill"
+]
+
+missing_columns = [
+    column
+    for column in required_columns
+    if column not in data.columns
+]
+
+if missing_columns:
+
+    print("ERROR: Missing Excel columns:")
+    print(", ".join(missing_columns))
+
+    raise SystemExit
+
+
+# Convert Due Date
+
+data[DUE_DATE_COLUMN] = pd.to_datetime(
+    data[DUE_DATE_COLUMN]
+).dt.date
+
+
+# Calculate target date
+
 today = date.today()
+
 target_date = today + timedelta(days=2)
+
 print("Today's date:", today)
 print("Checking bills due on:", target_date)
-# STEP 3: Convert Excel date
-data["Due Date"] = pd.to_datetime(data["Due Date"]).dt.date
-# STEP 4: Connect to Gmail
+
+
+# Connect to Gmail
+
 print("Connecting to Gmail...")
-credentials = None
-# Check if login token already exists
-if os.path.exists(token_file):
-    credentials = Credentials.from_authorized_user_file(token_file,SCOPES)
-# If no login, ask Google for permission
-if not credentials or not credentials.valid:
-    flow = InstalledAppFlow.from_client_secrets_file(credentials_file,SCOPES)
-    credentials = flow.run_local_server(port=0)
-    # Save login permission
-    with open(token_file, "w") as file:
-        file.write(credentials.to_json())
-# Create Gmail connection
-gmail = build("gmail","v1",credentials=credentials)
+
+gmail_service = get_gmail_service()
+
+if gmail_service is None:
+    raise SystemExit
+
 print("Gmail connected successfully.")
-# STEP 5: Check every customer
+
+
+# Check every customer
+
+email_sent = False
+
 for index, row in data.iterrows():
-    customer_name = row["Customer Name"]
-    customer_email = row["Customer Email"]
-    amount = row["Amount Due"]
-    due_date = row["Due Date"]
-    # Send only if due date is exactly 2 days away
-    if due_date == target_date:
+
+    customer_name = row[CUSTOMER_NAME_COLUMN]
+    customer_email = row[CUSTOMER_EMAIL_COLUMN]
+
+    current_bill = float(row["Current Bill"])
+    wifi_bill = float(row["Wifi Bill"])
+    water_bill = float(row["Water Bill"])
+    mobile_bill = float(row["Mobile Bill"])
+    gas_bill = float(row["Gas Bill"])
+
+    due_date = row[DUE_DATE_COLUMN]
+
+    if check_customer_due(row, target_date):
+
         print("Bill found for:", customer_name)
-        # Create email
-        email = EmailMessage()
-        email["To"] = customer_email
-        email["Subject"] = ("Urgent Reminder: Invoice Payment Due in 2 Days")
-        email_body = f"""Hello {customer_name},
-This is a friendly reminder that your upcoming bill of ${amount:.2f} is due on {due_date}. Please ensure payment is submitted on time.
-Best regards,
-Finance Department"""
-        email.set_content(email_body)
-        # Convert email into Gmail format
-        encoded_email = base64.urlsafe_b64encode(email.as_bytes()).decode()
-        # Send email
-        gmail.users().messages().send(
-            userId="me",
-            body={
-                "raw": encoded_email
-            }
-        ).execute()
-        print("Email sent successfully to:",customer_email)
+
+        send_email(
+            gmail_service,
+            str(customer_name),
+            str(customer_email),
+            current_bill,
+            wifi_bill,
+            water_bill,
+            mobile_bill,
+            gas_bill,
+            due_date
+        )
+
+        email_sent = True
+
+
+if not email_sent:
+
+    print(
+        "No bills are due exactly 2 days from today."
+    )
+
+
 print("Program finished.")
